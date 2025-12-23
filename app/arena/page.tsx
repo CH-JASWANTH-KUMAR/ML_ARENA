@@ -1,9 +1,12 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useMemo, useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
-import type { PoseDetector } from '@tensorflow-models/pose-detection';
+import * as tf from '@tensorflow/tfjs';
+import '@tensorflow/tfjs-backend-webgl';
+import '@tensorflow/tfjs-backend-wasm';
+import * as poseDetection from '@tensorflow-models/pose-detection';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // Initialize Gemini AI
@@ -20,8 +23,21 @@ interface Pose {
   }>;
 }
 
+type Keypoint = Pose['keypoints'][number];
+
+const MIN_KP_SCORE = 0.35;
 const POSE_HOLD_SECONDS = 2;
 const POSE_TIME_LIMIT_SECONDS = 20;
+
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+const getKp = (pose: Pose, name: string, minScore = MIN_KP_SCORE): Keypoint | null => {
+  const kp = pose.keypoints.find((k) => k.name === name);
+  if (!kp) return null;
+  const score = kp.score ?? 0;
+  if (score < minScore) return null;
+  return kp;
+};
 
 // Simplified challenges array
 const challenges = [
@@ -91,7 +107,7 @@ export default function ArenaPage() {
   const [score, setScore] = useState(0);
   const [accuracy, setAccuracy] = useState(0);
   const [countdown, setCountdown] = useState(3);
-  const [detector, setDetector] = useState<PoseDetector | null>(null);
+  const [detector, setDetector] = useState<poseDetection.PoseDetector | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [holdTime, setHoldTime] = useState(0);
   const [poseTimeLeft, setPoseTimeLeft] = useState(POSE_TIME_LIMIT_SECONDS);
@@ -125,6 +141,11 @@ export default function ArenaPage() {
     try {
       setIsLoading(true);
       
+      // Initialize TensorFlow first
+      await tf.setBackend('webgl');
+      await tf.ready();
+      console.log('TensorFlow ready with backend:', tf.getBackend());
+      
       // Get camera stream
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: 'user' },
@@ -136,23 +157,29 @@ export default function ArenaPage() {
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         videoRef.current.onloadedmetadata = async () => {
-          await videoRef.current?.play();
-          
-          // Load TensorFlow and MoveNet
-          const tf = await import('@tensorflow/tfjs');
-          const poseDetection = await import('@tensorflow-models/pose-detection');
-          
-          await tf.ready();
-          
-          const detector = await poseDetection.createDetector(
-            poseDetection.SupportedModels.MoveNet,
-            { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
-          );
-          
-          setDetector(detector);
-          setIsLoading(false);
-          setGameState('playing');
-          startDetection(detector);
+          try {
+            await videoRef.current?.play();
+            
+            // Load MoveNet model
+            console.log('Loading MoveNet model...');
+            const detector = await poseDetection.createDetector(
+              poseDetection.SupportedModels.MoveNet,
+              { 
+                modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+                enableSmoothing: true 
+              }
+            );
+            
+            console.log('MoveNet model loaded successfully');
+            setDetector(detector);
+            setIsLoading(false);
+            setGameState('playing');
+            startDetection(detector);
+          } catch (modelError) {
+            console.error('Model loading error:', modelError);
+            setIsLoading(false);
+            alert('Failed to load AI model. Please refresh and try again.');
+          }
         };
       }
     } catch (error) {
@@ -182,7 +209,7 @@ export default function ArenaPage() {
     return canvas.toDataURL('image/jpeg', 0.8);
   };
 
-  const startDetection = async (poseDetector: PoseDetector) => {
+  const startDetection = async (poseDetector: poseDetection.PoseDetector) => {
     const detect = async () => {
       if (!videoRef.current || !canvasRef.current || gameState === 'finished') {
         return;
@@ -340,6 +367,18 @@ export default function ArenaPage() {
       cancelAnimationFrame(animationFrameRef.current);
     }
   };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div className="relative min-h-screen w-full bg-gradient-to-br from-[#0a1929] via-[#1a237e] to-[#311b92]">
