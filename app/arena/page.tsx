@@ -1,13 +1,14 @@
 'use client';
 
-import { useMemo, useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
-import * as tf from '@tensorflow/tfjs';
-import '@tensorflow/tfjs-backend-webgl';
-import '@tensorflow/tfjs-backend-wasm';
-import * as poseDetection from '@tensorflow-models/pose-detection';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+
+// Lazy load TensorFlow only when needed
+let tf: any = null;
+let poseDetection: any = null;
+let modelCache: any = null;
 
 // Initialize Gemini AI
 const genAI = typeof window !== 'undefined' && process.env.NEXT_PUBLIC_GEMINI_API_KEY 
@@ -107,7 +108,7 @@ export default function ArenaPage() {
   const [score, setScore] = useState(0);
   const [accuracy, setAccuracy] = useState(0);
   const [countdown, setCountdown] = useState(3);
-  const [detector, setDetector] = useState<poseDetection.PoseDetector | null>(null);
+  const [detector, setDetector] = useState<any | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [holdTime, setHoldTime] = useState(0);
   const [poseTimeLeft, setPoseTimeLeft] = useState(POSE_TIME_LIMIT_SECONDS);
@@ -140,52 +141,97 @@ export default function ArenaPage() {
   const initializeCamera = async () => {
     try {
       setIsLoading(true);
+      console.log('🚀 Starting initialization...');
       
-      // Initialize TensorFlow first
-      await tf.setBackend('webgl');
-      await tf.ready();
-      console.log('TensorFlow ready with backend:', tf.getBackend());
+      // Load TensorFlow dynamically for faster initial page load
+      if (!tf) {
+        console.log('📦 Loading TensorFlow.js...');
+        tf = await import('@tensorflow/tfjs');
+        await import('@tensorflow/tfjs-backend-webgl');
+        console.log('✅ TensorFlow loaded');
+      }
+      
+      // Initialize backend
+      try {
+        await tf.setBackend('webgl');
+        await tf.ready();
+        console.log('✅ WebGL backend ready');
+      } catch (tfError) {
+        console.warn('⚠️  WebGL failed, trying WASM...');
+        await tf.setBackend('wasm');
+        await tf.ready();
+        console.log('✅ WASM backend ready');
+      }
+      
+      // Load pose detection
+      if (!poseDetection) {
+        console.log('📦 Loading Pose Detection library...');
+        poseDetection = await import('@tensorflow-models/pose-detection');
+        console.log('✅ Pose Detection loaded');
+      }
       
       // Get camera stream
+      console.log('📹 Requesting camera access...');
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480, facingMode: 'user' },
+        video: { 
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          facingMode: 'user' 
+        },
         audio: false,
       });
       
+      console.log('✅ Camera access granted');
       streamRef.current = stream;
       
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        
         videoRef.current.onloadedmetadata = async () => {
           try {
             await videoRef.current?.play();
+            console.log('✅ Video playing');
             
-            // Load MoveNet model
-            console.log('Loading MoveNet model...');
-            const detector = await poseDetection.createDetector(
-              poseDetection.SupportedModels.MoveNet,
-              { 
-                modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
-                enableSmoothing: true 
-              }
-            );
+            // Load or reuse cached MoveNet THUNDER model
+            if (!modelCache) {
+              console.log('🤖 Loading MoveNet THUNDER model (this may take a moment)...');
+              modelCache = await poseDetection.createDetector(
+                poseDetection.SupportedModels.MoveNet,
+                { 
+                  modelType: poseDetection.movenet.modelType.SINGLEPOSE_THUNDER,
+                  enableSmoothing: true 
+                }
+              );
+              console.log('✅ Model loaded and cached!');
+            } else {
+              console.log('✅ Using cached model');
+            }
             
-            console.log('MoveNet model loaded successfully');
-            setDetector(detector);
+            setDetector(modelCache);
             setIsLoading(false);
             setGameState('playing');
-            startDetection(detector);
+            startDetection(modelCache);
           } catch (modelError) {
-            console.error('Model loading error:', modelError);
+            console.error('❌ Model loading error:', modelError);
             setIsLoading(false);
-            alert('Failed to load AI model. Please refresh and try again.');
+            alert('Failed to load AI model. Please refresh and try again.\n\nError: ' + modelError);
+            if (stream) {
+              stream.getTracks().forEach(track => track.stop());
+            }
           }
+        };
+        
+        videoRef.current.onerror = (error) => {
+          console.error('❌ Video error:', error);
+          setIsLoading(false);
+          alert('Video stream error. Please refresh and try again.');
         };
       }
     } catch (error) {
-      console.error('Camera error:', error);
+      console.error('❌ Camera error:', error);
       setIsLoading(false);
-      alert('Failed to access camera. Please allow camera access and try again.');
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      alert('Failed to access camera. Please allow camera access and try again.\n\nError: ' + errorMessage);
     }
   };
 
@@ -209,7 +255,7 @@ export default function ArenaPage() {
     return canvas.toDataURL('image/jpeg', 0.8);
   };
 
-  const startDetection = async (poseDetector: poseDetection.PoseDetector) => {
+  const startDetection = async (poseDetector: any) => {
     const detect = async () => {
       if (!videoRef.current || !canvasRef.current || gameState === 'finished') {
         return;
